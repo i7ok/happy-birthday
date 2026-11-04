@@ -8,19 +8,21 @@
   const BG_W = 880;
   const BG_H = 1787;
   const HORIZON = 0.374; // eye level of the picture: the farther a person stands, the closer their feet are to it
-  const FRONT_Y = 0.8; // feet of the first person in the queue
+  const REF_Y = 0.8; // a person whose feet are at this height is drawn at scale 1
   const ADULT_PX = 880; // sprite height (px) of a standing adult; sprites keep their relative sizes
-  const ADULT_FRONT = 1.1 * (FRONT_Y - HORIZON); // adult height at the front, fraction of stage height
-  // Queue spots, front first: x = centre, y = feet. Size follows from y (perspective).
-  const SPOTS = [
-    { x: 0.52, y: FRONT_Y },
-    { x: 0.25, y: 0.7 },
-    { x: 0.82, y: 0.655 },
-    { x: 0.37, y: 0.59 },
-    { x: 0.47, y: 0.553 },
-    { x: 0.53, y: 0.515 },
-  ];
+  const ADULT_H = 1.1 * (REF_Y - HORIZON); // adult height at scale 1, fraction of stage height
+  const ZOOM = 1.3; // the stage is larger than the screen, so the camera can look up and down
+  // Spots, x = centre, y = feet; size follows from y (perspective).
+  // The speaker walks up close to the camera; the others wait in one straight line behind.
+  const FRONT = { x: 0.6, y: 0.86 };
+  const LINE_NEAR = { x: 0.24, y: 0.7 };
+  const LINE_FAR = { x: 0.4, y: 0.535 };
+  const WAITING = 5;
+  const SPOTS = [FRONT].concat(lineSpots(LINE_NEAR, LINE_FAR, WAITING));
   const VISIBLE = SPOTS.length;
+  // Brightness by spot: the farther back, the darker. Saturation drops a little with it.
+  const SHADE = [1, 0.78, 0.72, 0.67, 0.62, 0.58];
+  const BUBBLE_GAP = 24; // bubble bottom to the top of the speaker's head, px (the tail fits in here)
   const ASSETS = 'assets/characters/';
   const AGE_RE = /_(-18|\+18|RND)\.(png|webp|jpe?g)$/i;
   const TYPE_MS = 28;
@@ -43,6 +45,7 @@
   const endScreen = $('screen-end');
   const btnStart = $('btn-start');
   const btnAgain = $('btn-again');
+  const hint = $('hint');
 
   let L = null; // stage layout inside #app, px
   let queue = []; // people still in the queue, front first
@@ -50,9 +53,15 @@
   let done = 0;
   let score = 0;
   let accepting = false;
-  let exitSide = 1;
   let typing = null;
   let fullText = '';
+  let typedEl = null;
+  let restEl = null;
+  let framed = null; // the person the bubble and the camera are set up for
+  let cam = 0; // stage top inside #app, px; L.low = looking all the way down
+  let camHome = 0; // where the camera rests for the current speaker
+  let bubbleY = 0; // bubble top, stage px
+  let panned = false; // the player has found out about swiping
 
   // ---------- helpers ----------
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -62,6 +71,18 @@
     const m = AGE_RE.exec(file);
     if (!m) throw new Error('В имени файла нет _-18, _+18 или _RND: ' + file);
     return m[1].toUpperCase();
+  }
+
+  // Spots on a straight line on the floor, one equal step apart: depth grows evenly, scale = 1 / depth.
+  function lineSpots(near, far, n) {
+    const depth = (y) => (REF_Y - HORIZON) / (y - HORIZON);
+    const d0 = depth(near.y);
+    const d1 = depth(far.y);
+    return Array.from({ length: n }, (_, i) => {
+      const y = HORIZON + (REF_Y - HORIZON) / (d0 + ((d1 - d0) * i) / (n - 1));
+      const t = (near.y - y) / (near.y - far.y);
+      return { x: near.x + (far.x - near.x) * t, y };
+    });
   }
 
   function shuffle(list) {
@@ -95,9 +116,12 @@
       }
       return phrases[next++];
     };
+    // after the intro: everyone with a fixed age in random order, then all the RND ones, also shuffled
+    const isRnd = (file) => ageOf(file) === 'RND';
+    const order = shuffle(D.characters.filter((f) => !isRnd(f))).concat(shuffle(D.characters.filter(isRnd)));
     const people = D.intro
       .map((c) => ({ file: c.file, phrase: c.phrase }))
-      .concat(shuffle(D.characters.slice()).map((file) => ({ file, phrase: phrase() })));
+      .concat(order.map((file) => ({ file, phrase: phrase() })));
     return people.map((p) => {
       const age = ageOf(p.file);
       // RND: the answer is decided per game, so guessing it is a coin toss
@@ -110,22 +134,30 @@
   function computeLayout() {
     const w = app.clientWidth;
     const h = app.clientHeight;
-    const k = Math.max(w / BG_W, h / BG_H); // cover, anchored to the bottom (feet stay visible)
+    const k = Math.max(w / BG_W, h / BG_H) * ZOOM;
     const sw = BG_W * k;
     const sh = BG_H * k;
-    L = { w, h, sw, sh, left: (w - sw) / 2, top: h - sh };
+    L = { w, h, sw, sh, left: (w - sw) / 2, low: h - sh };
     stage.style.width = sw + 'px';
     stage.style.height = sh + 'px';
-    stage.style.transform = `translate(${L.left}px, ${L.top}px)`;
+  }
+
+  // Vertical camera: moves the stage (and the bubble with it) between the floor and the ceiling.
+  function setCamera(top) {
+    const lo = L.low;
+    const hi = Math.max(0, camHome); // a tall speaker may need a bit of ceiling above the picture
+    cam = Math.min(Math.max(top, lo), hi);
+    stage.style.transform = `translate(${L.left}px, ${cam}px)`;
+    bubble.style.top = bubbleY + cam + 'px';
   }
 
   function spotScale(i) {
     const s = SPOTS[Math.min(i, VISIBLE - 1)];
-    return (s.y - HORIZON) / (FRONT_Y - HORIZON);
+    return (s.y - HORIZON) / (REF_Y - HORIZON);
   }
 
   function size(p) {
-    p.h = ADULT_FRONT * L.sh * (p.nh / ADULT_PX);
+    p.h = ADULT_H * L.sh * (p.nh / ADULT_PX);
     p.w = p.h * (p.nw / p.nh);
     p.el.style.width = p.w + 'px';
     p.el.style.height = p.h + 'px';
@@ -138,20 +170,23 @@
     p.el.style.transform = `translate(${x}px, ${y}px) scale(${spotScale(i)})`;
     p.el.style.zIndex = String(100 - i);
     p.el.dataset.spot = String(i);
+    const b = SHADE[Math.min(i, SHADE.length - 1)];
+    p.el.firstChild.style.filter = `brightness(${b}) saturate(${(0.5 + b / 2).toFixed(2)})`;
   }
 
   function relayout() {
     computeLayout();
-    queueEl.classList.add('no-anim');
+    app.classList.add('no-anim');
     queue.forEach((p, i) => {
       if (p.el) {
         size(p);
         place(p, i);
       }
     });
-    queueEl.getBoundingClientRect();
-    queueEl.classList.remove('no-anim');
-    if (bubble.classList.contains('show') && queue[0] && queue[0].el) positionBubble(queue[0]);
+    if (framed && framed === queue[0]) positionBubble(framed);
+    setCamera(camHome);
+    app.getBoundingClientRect();
+    app.classList.remove('no-anim');
   }
 
   // ---------- queue ----------
@@ -197,37 +232,46 @@
     }
   }
 
-  // ---------- speech bubble ----------
+  // ---------- speech bubble + camera framing ----------
+  // The bubble always sits above the speaker's head, never on top of them. The camera rests where
+  // the bubble just clears the HUD, or as low as it goes if the speaker is short.
   function positionBubble(p) {
     const s = SPOTS[0];
-    const headX = L.left + s.x * L.sw;
-    const headY = L.top + s.y * L.sh - p.h; // top of the sprite in #app px
+    const headX = L.left + s.x * L.sw; // #app px
+    const headY = s.y * L.sh - p.h * spotScale(0); // top of the sprite, stage px
     bubble.style.left = '0px'; // measure at full available width
     const bw = bubble.offsetWidth;
     const bh = bubble.offsetHeight;
     const minTop = hud.offsetTop + hud.offsetHeight + 10;
+    bubbleY = headY - BUBBLE_GAP - bh;
+    camHome = Math.max(L.low, minTop - bubbleY);
     const left = Math.min(Math.max(headX - bw / 2, 12), L.w - bw - 12);
-    const top = Math.max(headY - bh - 22, minTop);
     bubble.style.left = left + 'px';
-    bubble.style.top = top + 'px';
     bubble.style.setProperty('--tail-x', Math.min(Math.max(headX - left, 26), bw - 26) + 'px');
   }
 
-  function say(p) {
+  // Puts p's phrase into the (still hidden) bubble and points the camera at p.
+  function frame(p) {
     clearInterval(typing);
     fullText = p.phrase;
-    const typed = document.createElement('span');
-    const rest = document.createElement('span');
-    rest.className = 'rest';
-    rest.textContent = fullText;
-    bubbleText.replaceChildren(typed, rest);
+    typedEl = document.createElement('span');
+    restEl = document.createElement('span');
+    restEl.className = 'rest'; // the untyped part keeps its place, so the bubble does not grow while typing
+    restEl.textContent = fullText;
+    bubbleText.replaceChildren(typedEl, restEl);
     positionBubble(p);
+    setCamera(camHome);
+    framed = p;
+  }
+
+  function say() {
+    clearInterval(typing);
     bubble.classList.add('show');
     let n = 0;
     typing = setInterval(() => {
       n++;
-      typed.textContent = fullText.slice(0, n);
-      rest.textContent = fullText.slice(n);
+      typedEl.textContent = fullText.slice(0, n);
+      restEl.textContent = fullText.slice(n);
       if (n >= fullText.length) clearInterval(typing);
     }, TYPE_MS);
   }
@@ -255,7 +299,9 @@
     const p = queue[0];
     if (!p) return finish();
     progressEl.textContent = `${done + 1} / ${total}`;
-    say(p);
+    if (framed !== p) frame(p);
+    say();
+    if (!panned) hint.classList.add('show');
     await wait(250);
     setAccepting(true);
   }
@@ -269,6 +315,7 @@
     if (ok) score++;
     scoreEl.textContent = '✓ ' + score;
     btn.classList.add('picked');
+    hint.classList.remove('show');
     finishTyping();
 
     const stamp = document.createElement('div');
@@ -289,12 +336,12 @@
   async function advance() {
     const leaving = queue.shift();
     const s = SPOTS[0];
-    const x = s.x * L.sw - leaving.w / 2 + exitSide * L.w * 0.9;
+    // the speaker steps out to the right, away from the line
+    const x = s.x * L.sw - leaving.w / 2 + L.w * 0.9;
     const y = s.y * L.sh - leaving.h + L.sh * 0.04;
     leaving.el.classList.add('walking');
-    leaving.el.style.transform = `translate(${x}px, ${y}px) scale(1.12)`;
+    leaving.el.style.transform = `translate(${x}px, ${y}px) scale(${spotScale(0) * 1.1})`;
     leaving.el.style.opacity = '0';
-    exitSide = -exitSide;
     setTimeout(() => leaving.el.remove(), 900);
 
     queue.forEach((p, i) => {
@@ -303,6 +350,7 @@
       place(p, i);
     });
     fillQueue(true);
+    if (queue[0] && queue[0].el) frame(queue[0]); // the camera follows the next speaker as they walk up
     await wait(WALK_MS);
     queue.forEach((p) => p.el && p.el.classList.remove('walking'));
     present();
@@ -341,7 +389,7 @@
     total = queue.length;
     done = 0;
     score = 0;
-    exitSide = 1;
+    framed = null;
     scoreEl.textContent = '✓ 0';
     progressEl.textContent = '';
   }
@@ -351,6 +399,7 @@
     queueEl.replaceChildren();
     newGame();
     await fillQueue(false);
+    if (queue[0] && queue[0].el) frame(queue[0]);
     present();
   }
 
@@ -359,7 +408,9 @@
     $('start-intro').textContent = T.intro;
     $('end-title').textContent = T.endTitle;
     btnAgain.textContent = T.again;
+    hint.textContent = T.hint;
     computeLayout();
+    setCamera(L.low);
     newGame();
 
     const first = queue.slice(0, VISIBLE).map((p) => p.file);
@@ -375,10 +426,47 @@
       : new Promise((resolve) => { bg.onload = resolve; bg.onerror = resolve; });
     await Promise.all([bgReady.then(tick), ...first.map((f) => load(f).then(tick, tick))]);
     await fillQueue(false);
+    if (queue[0] && queue[0].el) {
+      app.classList.add('no-anim');
+      frame(queue[0]);
+      app.getBoundingClientRect();
+      app.classList.remove('no-anim');
+    }
     btnStart.textContent = T.start;
     btnStart.disabled = false;
     queue.forEach((p) => load(p.file).catch(() => {})); // warm up the rest
   }
+
+  // ---------- looking up and down ----------
+  function look(top) {
+    setCamera(top);
+    if (!panned && Math.abs(cam - camHome) > 12) {
+      panned = true;
+      hint.classList.remove('show');
+    }
+  }
+
+  let drag = null;
+  app.addEventListener('pointerdown', (e) => {
+    if (drag || e.target.closest('button, .screen:not(.hidden)')) return;
+    drag = { id: e.pointerId, y: e.clientY, cam };
+    app.classList.add('dragging');
+    app.setPointerCapture(e.pointerId);
+  });
+  app.addEventListener('pointermove', (e) => {
+    if (drag && e.pointerId === drag.id) look(drag.cam + e.clientY - drag.y); // swipe up = look down
+  });
+  const endDrag = (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    drag = null;
+    app.classList.remove('dragging');
+  };
+  app.addEventListener('pointerup', endDrag);
+  app.addEventListener('pointercancel', endDrag);
+  app.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    look(cam - e.deltaY);
+  }, { passive: false });
 
   // ---------- input ----------
   btnStart.addEventListener('click', () => {
@@ -392,6 +480,8 @@
     if (e.repeat) return;
     if (e.key === 'ArrowLeft') answer('-18', btnMinus);
     else if (e.key === 'ArrowRight') answer('+18', btnPlus);
+    else if (e.key === 'ArrowDown') look(cam - 90);
+    else if (e.key === 'ArrowUp') look(cam + 90);
     else if (e.key === 'Enter') {
       if (!startScreen.classList.contains('hidden') && !btnStart.disabled) btnStart.click();
       else if (!endScreen.classList.contains('hidden')) btnAgain.click();
